@@ -2,20 +2,35 @@ import posix
 import tables
 import net
 import std/strformat
+import std/terminal
 import strutils
 import sequtils
 import std/endians
 import os
 
-proc ioctl(fd: cint, request: culong, argp: pointer): cint {.importc, header: "<sys/ioctl.h>".}
-type IfReq {.importc: "struct ifreq", header: "<net/if.h>", bycopy.} = object
-  ifr_name: array[16, char]
-
 const
   BIOCSETIF = 0x8020426c
-  BIOCPROMISC = 0x20004269
   BIOCIMMEDIATE = 0x80044270
   IFNAMSIZ = 16
+
+proc ioctl(fd: cint, request: culong, argp: pointer): cint {.importc, header: "<sys/ioctl.h>".}
+type IfReq {.importc: "struct ifreq", header: "<net/if.h>", bycopy.} = object
+  ifr_name: array[IFNAMSIZ, char]
+
+type Timeval* {.packed.} = object
+  tv_sec: int32
+  tv_usec: int32
+
+type BPFHeader* {.packed.} = object
+  timeval: Timeval
+  bh_caplen: uint32
+  bh_datalen: uint32
+  bh_hdrlen: uint16
+
+type EthernetHeader {.packed.} = object
+  dst: array[6, uint8]
+  src: array[6, uint8]
+  ethType: uint16
 
 const ETHERTYPES = {
     0x0800: "IPv4",
@@ -76,20 +91,6 @@ const ETHERTYPES = {
     0xF1C1: "Redundancy Tag (IEEE 802.1CB Frame Replication and Elimination for Reliability)"
 }.toTable
 
-type Timeval* {.packed.} = object
-  tv_sec: int32
-  tv_usec: int32
-
-type BPFHeader* {.packed.} = object
-  timeval: Timeval
-  bh_caplen: uint32
-  bh_datalen: uint32
-  bh_hdrlen: uint16
-
-type EthernetHeader {.packed.} = object
-  dst: array[6, uint8]
-  src: array[6, uint8]
-  ethType: uint16
 
 proc formatMac(mac: openArray[uint8]): string =
   mac.mapIt(fmt"{it:02x}").join(":")
@@ -120,19 +121,25 @@ proc open_bpf(self: var BPFLinkLayer) =
   var ifreq: IfReq
   copyMem(addr ifreq.ifr_name[0], self.iface.cstring, IFNAMSIZ)
 
-  let binding = ioctl(cint(self.bpf_fd), culong(BIOCSETIF), addr ifreq)
-
-  discard ioctl(cint(self.bpf_fd), culong(BIOCPROMISC), nil)
+  discard ioctl(cint(self.bpf_fd), culong(BIOCSETIF), addr ifreq)
   discard ioctl(cint(self.bpf_fd), culong(BIOCIMMEDIATE), cint(1))
 
   echo "Successfully bound to interface"
 
-proc read_frame(self: var BPFLinkLayer): Table[string, string] =
+type
+  FrameData = object
+    dest_mac: string
+    src_mac: string
+    eth_type: string
+    eth_type_name: string
+    payload: seq[uint8]
+
+proc read_frame(self: var BPFLinkLayer): FrameData =
   var buffer: array[4096, uint8]
   let bytesRead = read(cint(self.bpf_fd), addr buffer[0], buffer.len)
 
   if bytesRead <= 0:
-    echo "❌ Failed to read"
+    stdout.styledWriteLine(fgRed, "Failed to read\n")
     raise newException(Exception, "Failed to read")
 
   let bh = cast[ptr BPFHeader](unsafeAddr buffer[0])[]
@@ -141,39 +148,40 @@ proc read_frame(self: var BPFLinkLayer): Table[string, string] =
   let pktEnd = pktStart + bh.bh_caplen.int
 
   if pktEnd > buffer.len:
-    echo "❌ Packet data exceeds buffer length"
+    stdout.styledWriteLine(fgRed, "Packet data exceeds buffer length\n")
     raise newException(Exception, "Packet data exceeds buffer length")
 
   let ethFrame = buffer[pktStart ..< pktEnd]
   if ethFrame.len < 14:
-    echo "❌ Incomplete Ethernet frame"
+    stdout.styledWriteLine(fgRed, "Incomplete Ethernet frame\n")
     raise newException(Exception, "Incomplete Ethernet frame")
-
-  # echo "Ethernet frame: ", ethFrame
 
   let dest_mac = ethFrame[0..5]
   let src_mac = ethFrame[6..11]
   var eth_type: uint16
   bigEndian16(addr eth_type, unsafeAddr ethFrame[12])
-
+  let payload = ethFrame[14..<ethFrame.len]
 
   let dest_mac_str = formatMac(dest_mac)
   let src_mac_str = formatMac(src_mac)
   let eth_type_str = "0x" & eth_type.toHex(4)
 
-  var result = initTable[string, string]()
-
-  result["dest_mac"] = dest_mac_str
-  result["src_mac"] = src_mac_str
-  result["eth_type"] = eth_type_str
-  result["eth_type_name"] = ETHERTYPES.getOrDefault(int(eth_type), "Unknown")
-  return result
+  result = FrameData(
+    dest_mac: dest_mac_str,
+    src_mac: src_mac_str,
+    eth_type: eth_type_str,
+    eth_type_name: ETHERTYPES.getOrDefault(int(eth_type), "Unknown"),
+    payload: @payload
+  )
 
 if isMainModule:
   var bpf = BPFLinkLayer(iface: "en0")
   bpf.open_bpf()
   while true:
     let frame = bpf.read_frame()
-    echo frame
-    sleep(1000)
-
+    echo fmt"Source MAC: {frame.src_mac}"
+    echo fmt"Destination MAC: {frame.dest_mac}"
+    echo fmt"EtherType: {frame.eth_type} ({frame.eth_type_name})"
+    echo fmt"Payload length: {frame.payload.len} bytes"
+    echo "Payload: ", frame.payload.mapIt(fmt"{it:02x}").join("")
+    echo "---"
