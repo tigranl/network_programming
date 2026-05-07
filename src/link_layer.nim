@@ -178,7 +178,7 @@ iterator read_frames*(self: var BPFLinkLayer): FrameData =
       pos += (totalLen + BPF_ALIGNMENT - 1) and not (BPF_ALIGNMENT - 1)
 
 proc send_frame*(self: var BPFLinkLayer, frame: openArray[uint8]) =
-  let n = posix.write(cint(self.bpf_fd), addr frame[0], frame.len)
+  let n = write(cint(self.bpf_fd), addr frame[0], frame.len)
   if n < 0:
     let err = errno
     raise newException(IOError, fmt"BPF write failed: errno={err} ({$strerror(err)})")
